@@ -267,6 +267,24 @@ public:
 
 	virtual void assignOutputToInput(std::vector<std::vector<float>> &, std::vector<std::vector<float>> &) {}
 
+	/**
+	 * @brief Let a model with dynamic input shapes adapt to the incoming frame size.
+	 *
+	 * @return true if the input/output dims changed, in which case the caller must call
+	 * populateInputOutputShapes() and allocateTensorBuffers() again before inference.
+	 */
+	virtual bool configureForFrame(uint32_t frameWidth, uint32_t frameHeight)
+	{
+		UNUSED_PARAMETER(frameWidth);
+		UNUSED_PARAMETER(frameHeight);
+		return false;
+	}
+
+	/**
+	 * @brief Clear any state carried between frames (recurrent models).
+	 */
+	virtual void resetTemporalState() {}
+
 	virtual void runNetworkInference(const std::unique_ptr<Ort::Session> &session,
 					 const std::vector<Ort::AllocatedStringPtr> &inputNames,
 					 const std::vector<Ort::AllocatedStringPtr> &outputNames,
