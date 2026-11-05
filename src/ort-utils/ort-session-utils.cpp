@@ -81,9 +81,14 @@ int createOrtSession(filter_data *tf)
 		}
 #endif
 #if defined(__APPLE__)
-		if (tf->useGPU == USEGPU_COREML) {
+		if (tf->useGPU == USEGPU_COREML || tf->useGPU == USEGPU_COREML_GPU) {
 			uint32_t coreml_flags = 0;
 			coreml_flags |= COREML_FLAG_ENABLE_ON_SUBGRAPH;
+			if (tf->useGPU == USEGPU_COREML_GPU) {
+				// ML Program on CPU + GPU only: keeps full float precision (the Neural Engine runs
+				// in reduced precision, which degrades Robust Video Matting's recurrent state)
+				coreml_flags |= COREML_FLAG_CREATE_MLPROGRAM | COREML_FLAG_USE_CPU_AND_GPU;
+			}
 			Ort::ThrowOnError(
 				OrtSessionOptionsAppendExecutionProvider_CoreML(sessionOptions, coreml_flags));
 		}

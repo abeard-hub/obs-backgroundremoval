@@ -27,6 +27,8 @@
 #include <mutex>
 #include <regex>
 #include <thread>
+#include <condition_variable>
+#include <chrono>
 
 #include <util/platform.h>
 
@@ -86,6 +88,13 @@ struct background_removal_filter : public filter_data, public std::enable_shared
 	uint64_t memLastActionNs = 0;
 	int memStrikes = 0;
 	std::atomic<bool> memoryStopped{false};
+
+	// Mask worker thread: inference runs here, never on OBS's graphics thread
+	std::thread worker;
+	std::mutex workMutex;
+	std::condition_variable workCv;
+	bool workPending = false;
+	bool workerStop = false;
 
 	gs_effect_t *effect;
 	gs_effect_t *kawaseBlurEffect;
@@ -210,6 +219,7 @@ obs_properties_t *background_filter_properties(void *data)
 #endif
 #if defined(__APPLE__)
 	obs_property_list_add_string(p_use_gpu, obs_module_text("CoreML"), USEGPU_COREML);
+	obs_property_list_add_string(p_use_gpu, obs_module_text("CoreMLGPU"), USEGPU_COREML_GPU);
 #endif
 
 	obs_properties_add_int(props, "mask_every_x_frames", obs_module_text("CalculateMaskEveryXFrame"), 1, 300, 1);
@@ -483,6 +493,8 @@ void background_filter_deactivate(void *data)
 
 /**                   FILTER CORE                     */
 
+static void maskWorkerLoop(std::weak_ptr<background_removal_filter> weak);
+
 void *background_filter_create(obs_data_t *settings, obs_source_t *source)
 {
 	obs_log(LOG_INFO, "Background filter created");
@@ -501,6 +513,8 @@ void *background_filter_create(obs_data_t *settings, obs_source_t *source)
 		// Create pointer to shared_ptr for the update call
 		auto ptr = new std::shared_ptr<background_removal_filter>(instance);
 		background_filter_update(ptr, settings);
+
+		instance->worker = std::thread(maskWorkerLoop, std::weak_ptr<background_removal_filter>(instance));
 
 		// Return the pointer to the shared_ptr
 		// This keeps the reference count at least 1 until destroy is called
@@ -521,6 +535,16 @@ void background_filter_destroy(void *data)
 		if (*ptr) {
 			// Mark as disabled to prevent further processing
 			(*ptr)->isDisabled = true;
+
+			// Stop the mask worker and wait for any mask in progress
+			{
+				std::lock_guard<std::mutex> lock((*ptr)->workMutex);
+				(*ptr)->workerStop = true;
+			}
+			(*ptr)->workCv.notify_all();
+			if ((*ptr)->worker.joinable()) {
+				(*ptr)->worker.join();
+			}
 
 			// Perform cleanup
 			obs_enter_graphics();
@@ -838,31 +862,12 @@ static void checkMemoryWatchdog(std::shared_ptr<background_removal_filter> tf)
 	}
 }
 
-void background_filter_video_tick(void *data, float seconds)
+/**
+ * Computes one mask from the latest captured frame. Runs on the mask worker thread.
+ */
+static void computeMask(std::shared_ptr<background_removal_filter> tf)
 {
-	UNUSED_PARAMETER(seconds);
-
-	// Cast to shared_ptr pointer and create a local shared_ptr
-	auto *ptr = static_cast<std::shared_ptr<background_removal_filter> *>(data);
-	if (!ptr) {
-		return;
-	}
-
-	// Create a local shared_ptr
-	// This guarantees the object stays alive for the duration of this function scope
-	// even if filter_destroy is called on the main thread
-	std::shared_ptr<background_removal_filter> tf = *ptr;
-
-	if (!tf || tf->isDisabled) {
-		return;
-	}
-
-	if (!obs_source_enabled(tf->source)) {
-		return;
-	}
-
-	if (!tf->model) {
-		obs_log(LOG_ERROR, "Model is not initialized");
+	if (tf->isDisabled || !tf->model) {
 		return;
 	}
 
@@ -873,11 +878,7 @@ void background_filter_video_tick(void *data, float seconds)
 
 	cv::Mat imageBGRA;
 	{
-		std::unique_lock<std::mutex> lock(tf->inputBGRALock, std::try_to_lock);
-		if (!lock.owns_lock()) {
-			// No data to process
-			return;
-		}
+		std::lock_guard<std::mutex> lock(tf->inputBGRALock);
 		if (tf->inputBGRA.empty()) {
 			// No data to process
 			return;
@@ -898,9 +899,12 @@ void background_filter_video_tick(void *data, float seconds)
 		tf->lastImageBGRA = imageBGRA.clone();
 	}
 
-	if (tf->backgroundMask.empty()) {
-		// First frame. Initialize the background mask.
-		tf->backgroundMask = cv::Mat(imageBGRA.size(), CV_8UC1, cv::Scalar(255));
+	{
+		std::lock_guard<std::mutex> lock(tf->outputLock);
+		if (tf->backgroundMask.empty()) {
+			// First frame. Initialize the background mask.
+			tf->backgroundMask = cv::Mat(imageBGRA.size(), CV_8UC1, cv::Scalar(255));
+		}
 	}
 
 	tf->maskEveryXFramesCount++;
@@ -1016,6 +1020,58 @@ void background_filter_video_tick(void *data, float seconds)
 	} catch (const std::exception &e) {
 		obs_log(LOG_ERROR, "%s", e.what());
 	}
+}
+
+/**
+ * Mask worker thread. Waits for the graphics thread to signal a new frame, then computes the mask.
+ * Frames that arrive while a mask is being computed are skipped, so slow inference lowers the mask
+ * rate instead of stalling OBS's rendering.
+ */
+static void maskWorkerLoop(std::weak_ptr<background_removal_filter> weak)
+{
+	while (true) {
+		std::shared_ptr<background_removal_filter> tf = weak.lock();
+		if (!tf) {
+			return;
+		}
+		{
+			std::unique_lock<std::mutex> lock(tf->workMutex);
+			tf->workCv.wait_for(lock, std::chrono::milliseconds(200),
+					    [&] { return tf->workPending || tf->workerStop; });
+			if (tf->workerStop) {
+				return;
+			}
+			if (!tf->workPending) {
+				continue;
+			}
+			tf->workPending = false;
+		}
+		computeMask(tf);
+	}
+}
+
+void background_filter_video_tick(void *data, float seconds)
+{
+	UNUSED_PARAMETER(seconds);
+
+	auto *ptr = static_cast<std::shared_ptr<background_removal_filter> *>(data);
+	if (!ptr) {
+		return;
+	}
+	std::shared_ptr<background_removal_filter> tf = *ptr;
+	if (!tf || tf->isDisabled || tf->memoryStopped) {
+		return;
+	}
+	if (!obs_source_enabled(tf->source)) {
+		return;
+	}
+
+	// Hand the newest frame to the worker; never block the graphics thread on inference
+	{
+		std::lock_guard<std::mutex> lock(tf->workMutex);
+		tf->workPending = true;
+	}
+	tf->workCv.notify_one();
 }
 
 static gs_texture_t *blur_background(std::shared_ptr<background_removal_filter> tf, uint32_t width, uint32_t height,
