@@ -445,6 +445,7 @@ void background_filter_update(void *data, obs_data_t *settings)
 	// fresh watchdog state for the new settings
 	tf->memBaselineBytes = 0;
 	tf->memWatchStartNs = 0;
+	tf->memLastActionNs = 0;
 	tf->memStrikes = 0;
 	tf->memoryStopped = false;
 
@@ -821,6 +822,8 @@ static void checkMemoryWatchdog(std::shared_ptr<background_removal_filter> tf)
 		obs_log(LOG_WARNING, "Memory watchdog: switching inference device from %s to CPU",
 			tf->useGPU.c_str());
 		tf->useGPU = USEGPU_CPU;
+		// one CPU thread is too slow for real-time RVM; use four
+		tf->numThreads = std::max<uint32_t>(tf->numThreads, 4);
 	} else {
 		obs_log(LOG_WARNING, "Memory watchdog: rebuilding the inference session");
 	}
