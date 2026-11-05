@@ -1,0 +1,23 @@
+# Builds only the macOS installer (.pkg) for this fork. Run it from the Actions tab
+# ("Build macOS only" → "Run workflow"), or it runs on every push to main.
+name: Build macOS only
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  build-macos:
+    uses: ./.github/workflows/build-macos.yml
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+    with:
+      attest-artifacts: false
+      release-build: false
+      TAHOE_DEVELOPER_DIR: /Applications/Xcode_26.5.app
