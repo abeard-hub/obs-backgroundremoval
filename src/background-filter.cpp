@@ -28,6 +28,14 @@
 #include <regex>
 #include <thread>
 
+#include <util/platform.h>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
+
 #include "plugin-support.h"
 #include "models/ModelSINET.hpp"
 #include "models/ModelMediapipe.hpp"
@@ -70,6 +78,14 @@ struct background_removal_filter : public filter_data, public std::enable_shared
 	// Stable mask: hysteresis + main-subject filter + hole filling + guided edge refinement
 	bool stableMask = true;
 	cv::Mat lastPersonAlpha;
+
+	// Memory watchdog (see checkMemoryWatchdog)
+	uint64_t memBaselineBytes = 0;
+	uint64_t memWatchStartNs = 0;
+	uint64_t memLastCheckNs = 0;
+	uint64_t memLastActionNs = 0;
+	int memStrikes = 0;
+	std::atomic<bool> memoryStopped{false};
 
 	gs_effect_t *effect;
 	gs_effect_t *kawaseBlurEffect;
@@ -426,6 +442,12 @@ void background_filter_update(void *data, obs_data_t *settings)
 	obs_log(LOG_INFO, "  Model file path: %s", tf->modelFilepath.c_str());
 #endif
 
+	// fresh watchdog state for the new settings
+	tf->memBaselineBytes = 0;
+	tf->memWatchStartNs = 0;
+	tf->memStrikes = 0;
+	tf->memoryStopped = false;
+
 	// enable
 	tf->isDisabled = false;
 }
@@ -708,6 +730,111 @@ static void refineMaskStable(struct background_removal_filter *tf, const cv::Mat
 	backgroundMask = 255 - alpha8;
 }
 
+/**
+ * Physical memory footprint of the whole OBS process, in bytes (0 if unknown).
+ */
+static uint64_t processMemoryFootprintBytes()
+{
+#if defined(__APPLE__)
+	task_vm_info_data_t info;
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
+		return (uint64_t)info.phys_footprint;
+	}
+	return 0;
+#elif defined(__linux__)
+	FILE *f = fopen("/proc/self/statm", "r");
+	if (!f) {
+		return 0;
+	}
+	unsigned long size = 0, resident = 0;
+	const int n = fscanf(f, "%lu %lu", &size, &resident);
+	fclose(f);
+	return n == 2 ? (uint64_t)resident * (uint64_t)sysconf(_SC_PAGESIZE) : 0;
+#else
+	return 0;
+#endif
+}
+
+/**
+ * Memory watchdog.
+ *
+ * Records OBS's memory footprint 15 s after the filter starts. If the footprint later grows by more
+ * than 3 GB, the filter assumes the inference backend is leaking and escalates, at least 10 s apart:
+ *   1. rebuild the ONNX Runtime session (releases everything the backend allocated),
+ *   2. if it grows again: switch this filter to CPU inference and rebuild,
+ *   3. if it still grows: stop processing (the camera passes through unchanged).
+ * Every step is logged. Changing any filter setting resets the watchdog.
+ * This turns a runaway leak into, at worst, a few GB and a log entry instead of a frozen Mac.
+ */
+static void checkMemoryWatchdog(std::shared_ptr<background_removal_filter> tf)
+{
+	const uint64_t now = os_gettime_ns();
+	const uint64_t second = 1000000000ULL;
+	const uint64_t limitBytes = 3ULL * 1024 * 1024 * 1024;
+
+	if (tf->memWatchStartNs == 0) {
+		tf->memWatchStartNs = now;
+		return;
+	}
+	if (now - tf->memLastCheckNs < 2 * second) {
+		return;
+	}
+	tf->memLastCheckNs = now;
+
+	const uint64_t footprint = processMemoryFootprintBytes();
+	if (footprint == 0) {
+		return;
+	}
+	if (tf->memBaselineBytes == 0) {
+		if (now - tf->memWatchStartNs >= 15 * second) {
+			tf->memBaselineBytes = footprint;
+			obs_log(LOG_INFO, "Memory watchdog: baseline %.2f GB", footprint / 1073741824.0);
+		}
+		return;
+	}
+	if (footprint <= tf->memBaselineBytes + limitBytes) {
+		return;
+	}
+	if (tf->memLastActionNs != 0 && now - tf->memLastActionNs < 10 * second) {
+		return; // give the previous step time to take effect
+	}
+	tf->memLastActionNs = now;
+	tf->memStrikes++;
+
+	obs_log(LOG_WARNING, "Memory watchdog: OBS memory grew from %.2f GB to %.2f GB (step %d)",
+		tf->memBaselineBytes / 1073741824.0, footprint / 1073741824.0, tf->memStrikes);
+
+	if (tf->memStrikes >= 3) {
+		obs_log(LOG_ERROR,
+			"Memory watchdog: still growing after rebuilding and switching to CPU. Background removal "
+			"is paused for this source; change any filter setting to resume.");
+		tf->memoryStopped = true;
+		return;
+	}
+
+	std::unique_lock<std::mutex> lock(tf->modelMutex);
+	if (!tf->model) {
+		return;
+	}
+	if (tf->memStrikes == 2 && tf->useGPU != USEGPU_CPU) {
+		obs_log(LOG_WARNING, "Memory watchdog: switching inference device from %s to CPU",
+			tf->useGPU.c_str());
+		tf->useGPU = USEGPU_CPU;
+	} else {
+		obs_log(LOG_WARNING, "Memory watchdog: rebuilding the inference session");
+	}
+	tf->model->resetTemporalState();
+	tf->lastPersonAlpha.release();
+	tf->lastBackgroundMask.release();
+	const int result = createOrtSession(tf.get());
+	if (result != OBS_BGREMOVAL_ORT_SESSION_SUCCESS) {
+		obs_log(LOG_ERROR, "Memory watchdog: failed to rebuild session (%d). Pausing background removal.",
+			result);
+		tf->memoryStopped = true;
+	}
+}
+
 void background_filter_video_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -733,6 +860,11 @@ void background_filter_video_tick(void *data, float seconds)
 
 	if (!tf->model) {
 		obs_log(LOG_ERROR, "Model is not initialized");
+		return;
+	}
+
+	checkMemoryWatchdog(tf);
+	if (tf->memoryStopped) {
 		return;
 	}
 
@@ -950,6 +1082,13 @@ void background_filter_video_render(void *data, gs_effect_t *_effect)
 
 	if (!tf || tf->isDisabled) {
 		if (tf && tf->source) {
+			obs_source_skip_video_filter(tf->source);
+		}
+		return;
+	}
+
+	if (tf->memoryStopped) {
+		if (tf->source) {
 			obs_source_skip_video_filter(tf->source);
 		}
 		return;
