@@ -480,6 +480,10 @@ jobs:
 
           if [[ "$CODESIGN_ENABLED" == true ]]; then
             codesign -s "$MACOS_SIGNING_APPLICATION_IDENTITY" -f --deep --options runtime --timestamp "$PLUGIN_BUNDLE"
+          else
+            # Unsigned builds (forks): ad-hoc sign so macOS accepts the plugin's code signature
+            codesign --force --deep --sign - "$PLUGIN_BUNDLE"
+            codesign --verify --deep --strict --verbose=2 "$PLUGIN_BUNDLE"
           fi
 
           pkgbuild \
