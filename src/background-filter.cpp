@@ -65,6 +65,12 @@ struct background_removal_filter : public filter_data, public std::enable_shared
 	float blurFocusPoint = 0.1f;
 	float blurFocusDepth = 0.1f;
 
+	// Robust Video Matting resolution (0 fast/legacy, 1 balanced, 2 high)
+	int rvmQuality = 1;
+	// Stable mask: hysteresis + main-subject filter + hole filling + guided edge refinement
+	bool stableMask = true;
+	cv::Mat lastPersonAlpha;
+
 	gs_effect_t *effect;
 	gs_effect_t *kawaseBlurEffect;
 
@@ -118,7 +124,7 @@ static bool enable_advanced_settings(obs_properties_t *ppts, obs_property_t *p, 
 	for (const char *prop_name :
 	     {"model_select", "useGPU", "mask_every_x_frames", "numThreads", "enable_focal_blur", "enable_threshold",
 	      "threshold_group", "focal_blur_group", "temporal_smooth_factor", "image_similarity_threshold",
-	      "enable_image_similarity", "mask_expansion"}) {
+	      "enable_image_similarity", "mask_expansion", "rvm_quality", "stable_mask"}) {
 		p = obs_properties_get(ppts, prop_name);
 		obs_property_set_visible(p, enabled);
 	}
@@ -206,6 +212,14 @@ obs_properties_t *background_filter_properties(void *data)
 	obs_property_list_add_string(p_model_select, obs_module_text("Robust Video Matting"), MODEL_RVM);
 	obs_property_list_add_string(p_model_select, obs_module_text("TCMonoDepth"), MODEL_DEPTH_TCMONODEPTH);
 
+	obs_property_t *p_rvm_quality = obs_properties_add_list(props, "rvm_quality", obs_module_text("RVMQuality"),
+								OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p_rvm_quality, obs_module_text("RVMQualityFast"), 0);
+	obs_property_list_add_int(p_rvm_quality, obs_module_text("RVMQualityBalanced"), 1);
+	obs_property_list_add_int(p_rvm_quality, obs_module_text("RVMQualityHigh"), 2);
+
+	obs_properties_add_bool(props, "stable_mask", obs_module_text("StableMask"));
+
 	obs_properties_add_float_slider(props, "temporal_smooth_factor", obs_module_text("TemporalSmoothFactor"), 0.0,
 					1.0, 0.01);
 
@@ -271,6 +285,8 @@ void background_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "numThreads", 1);
 	obs_data_set_default_bool(settings, "enable_focal_blur", false);
 	obs_data_set_default_double(settings, "temporal_smooth_factor", 0.85);
+	obs_data_set_default_int(settings, "rvm_quality", 1);
+	obs_data_set_default_bool(settings, "stable_mask", true);
 	obs_data_set_default_double(settings, "image_similarity_threshold", 35.0);
 	obs_data_set_default_bool(settings, "enable_image_similarity", true);
 	obs_data_set_default_double(settings, "blur_focus_point", 0.1);
@@ -311,6 +327,8 @@ void background_filter_update(void *data, obs_data_t *settings)
 	tf->temporalSmoothFactor = (float)obs_data_get_double(settings, "temporal_smooth_factor");
 	tf->imageSimilarityThreshold = (float)obs_data_get_double(settings, "image_similarity_threshold");
 	tf->enableImageSimilarity = (float)obs_data_get_bool(settings, "enable_image_similarity");
+	tf->rvmQuality = (int)obs_data_get_int(settings, "rvm_quality");
+	tf->stableMask = obs_data_get_bool(settings, "stable_mask");
 
 	const std::string newUseGpu = obs_data_get_string(settings, "useGPU");
 	const std::string newModel = obs_data_get_string(settings, "model_select");
@@ -358,6 +376,13 @@ void background_filter_update(void *data, obs_data_t *settings)
 		}
 	}
 
+	{
+		std::unique_lock<std::mutex> lock(tf->modelMutex);
+		if (auto *rvm = dynamic_cast<ModelRVM *>(tf->model.get())) {
+			rvm->setQuality(tf->rvmQuality);
+		}
+	}
+
 	obs_enter_graphics();
 
 	char *effect_path = obs_module_file(EFFECT_PATH);
@@ -388,6 +413,8 @@ void background_filter_update(void *data, obs_data_t *settings)
 	obs_log(LOG_INFO, "  Mask Every X Frames: %d", tf->maskEveryXFrames);
 	obs_log(LOG_INFO, "  Enable Image Similarity: %s", tf->enableImageSimilarity ? "true" : "false");
 	obs_log(LOG_INFO, "  Image Similarity Threshold: %f", tf->imageSimilarityThreshold);
+	obs_log(LOG_INFO, "  RVM Quality: %d", tf->rvmQuality);
+	obs_log(LOG_INFO, "  Stable Mask: %s", tf->stableMask ? "true" : "false");
 	obs_log(LOG_INFO, "  Blur Background: %d", tf->blurBackground);
 	obs_log(LOG_INFO, "  Enable Focal Blur: %s", tf->enableFocalBlur ? "true" : "false");
 	obs_log(LOG_INFO, "  Blur Focus Point: %f", tf->blurFocusPoint);
@@ -491,11 +518,26 @@ void background_filter_destroy(void *data)
 static void processImageForBackground(struct background_removal_filter *tf, const cv::Mat &imageBGRA,
 				      cv::Mat &backgroundMask)
 {
+	// Models with dynamic input shapes (RVM) size themselves to the frame
+	if (tf->model && tf->session && tf->model->configureForFrame((uint32_t)imageBGRA.cols, (uint32_t)imageBGRA.rows)) {
+		tf->model->populateInputOutputShapes(tf->session, tf->inputDims, tf->outputDims);
+		tf->model->allocateTensorBuffers(tf->inputDims, tf->outputDims, tf->outputTensorValues,
+						 tf->inputTensorValues, tf->inputTensor, tf->outputTensor);
+		tf->lastPersonAlpha.release();
+		tf->lastBackgroundMask.release();
+	}
+
 	cv::Mat outputImage;
 	if (!runFilterModelInference(tf, imageBGRA, outputImage)) {
 		return;
 	}
 	// Assume outputImage is now a single channel, uint8 image with values between 0 and 255
+
+	if (tf->stableMask) {
+		// Keep the soft output; refineMaskStable() does the thresholding
+		backgroundMask = 255 - outputImage;
+		return;
+	}
 
 	// If we have a threshold, apply it. Otherwise, just use the output image as the mask
 	if (tf->enableThreshold) {
@@ -505,6 +547,165 @@ static void processImageForBackground(struct background_removal_filter *tf, cons
 	} else {
 		backgroundMask = 255 - outputImage;
 	}
+}
+
+/**
+ * Fast guided filter (He et al.): smooths p while following the edges in the guide image I.
+ * I and p are CV_32F single channel, same size.
+ */
+static cv::Mat guidedFilter(const cv::Mat &I, const cv::Mat &p, int r, double eps)
+{
+	const cv::Size k(2 * r + 1, 2 * r + 1);
+	cv::Mat meanI, meanP, corrIP, corrII;
+	cv::boxFilter(I, meanI, CV_32F, k);
+	cv::boxFilter(p, meanP, CV_32F, k);
+	cv::boxFilter(I.mul(p), corrIP, CV_32F, k);
+	cv::boxFilter(I.mul(I), corrII, CV_32F, k);
+	cv::Mat covIP = corrIP - meanI.mul(meanP);
+	cv::Mat varI = corrII - meanI.mul(meanI);
+	cv::Mat a, b;
+	cv::divide(covIP, varI + eps, a);
+	b = meanP - a.mul(meanI);
+	cv::Mat meanA, meanB;
+	cv::boxFilter(a, meanA, CV_32F, k);
+	cv::boxFilter(b, meanB, CV_32F, k);
+	return meanA.mul(I) + meanB;
+}
+
+/**
+ * Stable mask refinement.
+ *
+ * Input: soft background mask at model resolution (255 = background).
+ * Output: soft background mask at frame resolution.
+ *
+ * 1. Asymmetric temporal smoothing: the person is added quickly but removed slowly, so a one-frame
+ *    dropout on the face does not punch a hole in it.
+ * 2. Hysteresis: confident pixels (>= threshold + 0.2) seed the person; less confident pixels
+ *    (>= threshold - 0.25) are kept only if they connect to a seed.
+ * 3. Main subject: drop blobs smaller than 15% of the largest one (stray furniture, shelves).
+ * 4. Fill holes inside the person that are smaller than 5% of the frame (face/shirt dropouts).
+ * 5. Edge refinement: a guided filter on the camera image snaps the edge to hair and shoulders.
+ */
+static void refineMaskStable(struct background_removal_filter *tf, const cv::Mat &imageBGRA,
+			     cv::Mat &backgroundMask)
+{
+	cv::Mat person;
+	cv::Mat(255 - backgroundMask).convertTo(person, CV_32F, 1.0 / 255.0);
+
+	// 1. temporal
+	if (!tf->lastPersonAlpha.empty() && tf->lastPersonAlpha.size() == person.size()) {
+		cv::Mat fast, slow;
+		cv::addWeighted(person, 0.9, tf->lastPersonAlpha, 0.1, 0.0, fast);
+		cv::addWeighted(person, 0.6, tf->lastPersonAlpha, 0.4, 0.0, slow);
+		cv::Mat rising = person > tf->lastPersonAlpha;
+		fast.copyTo(slow, rising);
+		person = slow;
+	}
+	tf->lastPersonAlpha = person.clone();
+
+	// 2. hysteresis
+	const float hi = std::min(tf->threshold + 0.2f, 0.95f);
+	const float lo = std::max(tf->threshold - 0.25f, 0.05f);
+	cv::Mat strong = person >= hi;
+	cv::Mat weak = person >= lo;
+
+	cv::Mat labels, stats, centroids;
+	const int n = cv::connectedComponentsWithStats(weak, labels, stats, centroids, 8, CV_32S);
+	std::vector<uint8_t> keep((size_t)n, 0);
+	for (int y = 0; y < labels.rows; y++) {
+		const int32_t *l = labels.ptr<int32_t>(y);
+		const uint8_t *s = strong.ptr<uint8_t>(y);
+		for (int x = 0; x < labels.cols; x++) {
+			if (s[x]) {
+				keep[(size_t)l[x]] = 1;
+			}
+		}
+	}
+	keep[0] = 0;
+
+	// 3. main subject
+	int maxArea = 0;
+	for (int i = 1; i < n; i++) {
+		if (keep[(size_t)i]) {
+			maxArea = std::max(maxArea, stats.at<int32_t>(i, cv::CC_STAT_AREA));
+		}
+	}
+	for (int i = 1; i < n; i++) {
+		if (keep[(size_t)i] && stats.at<int32_t>(i, cv::CC_STAT_AREA) < (int)(maxArea * 0.15)) {
+			keep[(size_t)i] = 0;
+		}
+	}
+	cv::Mat core(person.size(), CV_8UC1);
+	for (int y = 0; y < labels.rows; y++) {
+		const int32_t *l = labels.ptr<int32_t>(y);
+		uint8_t *c = core.ptr<uint8_t>(y);
+		for (int x = 0; x < labels.cols; x++) {
+			c[x] = keep[(size_t)l[x]] ? 255 : 0;
+		}
+	}
+
+	// 4. fill holes
+	{
+		cv::Mat inv = 255 - core;
+		cv::Mat hl, hs, hc;
+		const int hn = cv::connectedComponentsWithStats(inv, hl, hs, hc, 4, CV_32S);
+		const int maxHole = (int)(core.total() * 0.05);
+		std::vector<uint8_t> fill((size_t)hn, 0);
+		for (int i = 1; i < hn; i++) {
+			const int x = hs.at<int32_t>(i, cv::CC_STAT_LEFT);
+			const int y = hs.at<int32_t>(i, cv::CC_STAT_TOP);
+			const int w = hs.at<int32_t>(i, cv::CC_STAT_WIDTH);
+			const int h = hs.at<int32_t>(i, cv::CC_STAT_HEIGHT);
+			const int a = hs.at<int32_t>(i, cv::CC_STAT_AREA);
+			if (x > 0 && y > 0 && x + w < core.cols && y + h < core.rows && a < maxHole) {
+				fill[(size_t)i] = 1;
+			}
+		}
+		for (int y = 0; y < hl.rows; y++) {
+			const int32_t *l = hl.ptr<int32_t>(y);
+			uint8_t *c = core.ptr<uint8_t>(y);
+			for (int x = 0; x < hl.cols; x++) {
+				if (fill[(size_t)l[x]]) {
+					c[x] = 255;
+				}
+			}
+		}
+	}
+
+	// soft alpha: zero outside a band around the core, solid inside it
+	const int kk = std::max(3, (std::max(core.rows, core.cols) / 80) | 1);
+	const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(kk, kk));
+	cv::Mat band, inner;
+	cv::dilate(core, band, kernel);
+	cv::erode(core, inner, kernel);
+	cv::Mat alpha = person.clone();
+	alpha.setTo(0.0f, band == 0);
+	alpha.setTo(1.0f, inner > 0);
+
+	// 5. guided edge refinement at a capped working resolution
+	const int frameW = imageBGRA.cols, frameH = imageBGRA.rows;
+	const int workLong = std::min(std::max(frameW, frameH), 960);
+	const double sc = (double)workLong / (double)std::max(frameW, frameH);
+	const cv::Size workSize(std::max(1, (int)std::lround(frameW * sc)), std::max(1, (int)std::lround(frameH * sc)));
+
+	cv::Mat alphaWork, grayWork, smallBGRA;
+	cv::resize(alpha, alphaWork, workSize, 0, 0, cv::INTER_LINEAR);
+	cv::resize(imageBGRA, smallBGRA, workSize, 0, 0, cv::INTER_AREA);
+	cv::cvtColor(smallBGRA, grayWork, cv::COLOR_BGRA2GRAY);
+	grayWork.convertTo(grayWork, CV_32F, 1.0 / 255.0);
+	alphaWork = guidedFilter(grayWork, alphaWork, std::max(2, workLong / 240), 1e-3);
+
+	cv::Mat alpha8;
+	alphaWork.convertTo(alpha8, CV_8U, 255.0); // saturates to [0, 255]
+	cv::resize(alpha8, alpha8, imageBGRA.size(), 0, 0, cv::INTER_LINEAR);
+
+	if (tf->maskExpansion > 0) {
+		cv::dilate(alpha8, alpha8, cv::Mat(), cv::Point(-1, -1), tf->maskExpansion);
+	} else if (tf->maskExpansion < 0) {
+		cv::erode(alpha8, alpha8, cv::Mat(), cv::Point(-1, -1), -tf->maskExpansion);
+	}
+
+	backgroundMask = 255 - alpha8;
 }
 
 void background_filter_video_tick(void *data, float seconds)
@@ -588,6 +789,13 @@ void background_filter_video_tick(void *data, float seconds)
 				// Something went wrong. Just use the previous mask.
 				obs_log(LOG_WARNING,
 					"Background mask is empty. This shouldn't happen. Using previous mask.");
+				return;
+			}
+
+			if (tf->stableMask) {
+				refineMaskStable(tf.get(), imageBGRA, backgroundMask);
+				std::lock_guard<std::mutex> lock(tf->outputLock);
+				backgroundMask.copyTo(tf->backgroundMask);
 				return;
 			}
 
